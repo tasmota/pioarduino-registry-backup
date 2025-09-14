@@ -2,7 +2,6 @@ name: Sync Upstream Releases
 
 on:
   schedule:
-    # Täglich um 02:00 UTC prüfen
     - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
@@ -42,9 +41,9 @@ jobs:
       run: |
         echo "Fetching releases from $UPSTREAM_REPO..."
         
-        # Alle Releases vom upstream Repository abrufen
+        # Nur verfügbare Felder verwenden
         gh release list -R "$UPSTREAM_REPO" \
-          --json tagName,name,body,draft,prerelease,publishedAt,assets \
+          --json tagName,name,isDraft,isPrerelease,publishedAt,createdAt \
           --limit 50 > upstream_releases.json
         
         echo "Found $(jq length upstream_releases.json) upstream releases"
@@ -55,7 +54,6 @@ jobs:
       run: |
         echo "Fetching existing releases from fork..."
         
-        # Existierende Releases im Fork abrufen
         gh release list -R "$FORK_REPO" \
           --json tagName \
           --limit 50 > fork_releases.json || echo "[]" > fork_releases.json
@@ -65,18 +63,14 @@ jobs:
     - name: Determine Releases to Sync
       id: sync_plan
       run: |
-        # Releases identifizieren, die synchronisiert werden müssen
         if [ "${{ github.event.inputs.specific_tag }}" != "" ]; then
-          # Nur spezifischen Tag synchronisieren
           echo "Syncing specific tag: ${{ github.event.inputs.specific_tag }}"
           jq --arg tag "${{ github.event.inputs.specific_tag }}" \
              '[.[] | select(.tagName == $tag)]' upstream_releases.json > releases_to_sync.json
         elif [ "${{ github.event.inputs.force_sync }}" == "true" ]; then
-          # Alle Releases synchronisieren (force)
           echo "Force syncing all releases"
           cp upstream_releases.json releases_to_sync.json
         else
-          # Nur neue Releases synchronisieren
           echo "Syncing new releases only"
           jq --slurpfile fork fork_releases.json \
              '[.[] | select(.tagName as $tag | $fork[0] | map(.tagName) | index($tag) | not)]' \
@@ -95,32 +89,32 @@ jobs:
     - name: Create Workspace
       if: steps.sync_plan.outputs.releases_count > 0
       run: |
-        mkdir -p release_assets
         mkdir -p temp_downloads
     
     - name: Sync Releases
       if: steps.sync_plan.outputs.releases_count > 0
       run: |
-        # Jedes Release verarbeiten
         jq -c '.[]' releases_to_sync.json | while read -r release; do
           TAG_NAME=$(echo "$release" | jq -r '.tagName')
           RELEASE_NAME=$(echo "$release" | jq -r '.name')
-          RELEASE_BODY=$(echo "$release" | jq -r '.body // ""')
-          IS_DRAFT=$(echo "$release" | jq -r '.draft')
-          IS_PRERELEASE=$(echo "$release" | jq -r '.prerelease')
-          ASSETS=$(echo "$release" | jq -c '.assets')
-          ASSETS_COUNT=$(echo "$ASSETS" | jq length)
+          IS_DRAFT=$(echo "$release" | jq -r '.isDraft')
+          IS_PRERELEASE=$(echo "$release" | jq -r '.isPrerelease')
           
           echo "=== Syncing Release: $TAG_NAME ==="
-          echo "Assets count: $ASSETS_COUNT"
           
-          # Release im Fork erstellen (falls nicht existiert)
+          # Release Notes separat abrufen (falls verfügbar)
+          RELEASE_BODY=""
+          if gh release view "$TAG_NAME" -R "$UPSTREAM_REPO" --json body >/dev/null 2>&1; then
+            RELEASE_BODY=$(gh release view "$TAG_NAME" -R "$UPSTREAM_REPO" --json body --jq '.body // ""')
+          fi
+          
+          # Release-Flags setzen
           DRAFT_FLAG=""
           PRERELEASE_FLAG=""
           [ "$IS_DRAFT" == "true" ] && DRAFT_FLAG="--draft"
           [ "$IS_PRERELEASE" == "true" ] && PRERELEASE_FLAG="--prerelease"
           
-          # Prüfen ob Release bereits existiert
+          # Existierendes Release löschen falls vorhanden
           if gh release view "$TAG_NAME" -R "$FORK_REPO" >/dev/null 2>&1; then
             echo "Release $TAG_NAME already exists, deleting first..."
             gh release delete "$TAG_NAME" -R "$FORK_REPO" --yes || true
@@ -128,38 +122,47 @@ jobs:
           
           # Release erstellen
           echo "Creating release $TAG_NAME..."
-          echo "$RELEASE_BODY" > temp_body.md
-          gh release create "$TAG_NAME" \
-            -R "$FORK_REPO" \
-            --title "$RELEASE_NAME" \
-            --notes-file temp_body.md \
-            $DRAFT_FLAG $PRERELEASE_FLAG
+          if [ -n "$RELEASE_BODY" ]; then
+            echo "$RELEASE_BODY" > temp_body.md
+            gh release create "$TAG_NAME" \
+              -R "$FORK_REPO" \
+              --title "$RELEASE_NAME" \
+              --notes-file temp_body.md \
+              $DRAFT_FLAG $PRERELEASE_FLAG
+          else
+            gh release create "$TAG_NAME" \
+              -R "$FORK_REPO" \
+              --title "$RELEASE_NAME" \
+              --notes "Synced from upstream: $UPSTREAM_REPO" \
+              $DRAFT_FLAG $PRERELEASE_FLAG
+          fi
           
           # Assets herunterladen und hochladen
-          if [ "$ASSETS_COUNT" -gt 0 ]; then
-            echo "Downloading and uploading $ASSETS_COUNT assets..."
-            
-            # Assets vom upstream herunterladen
-            cd temp_downloads
-            gh release download "$TAG_NAME" -R "$UPSTREAM_REPO" || {
-              echo "Failed to download assets for $TAG_NAME"
-              cd ..
-              continue
-            }
-            
-            # Alle heruntergeladenen Dateien zum Fork-Release hochladen
-            if ls ./* >/dev/null 2>&1; then
-              echo "Uploading assets to fork release..."
-              gh release upload "$TAG_NAME" -R "$FORK_REPO" ./* || {
-                echo "Failed to upload some assets for $TAG_NAME"
-              }
+          echo "Downloading assets for $TAG_NAME..."
+          cd temp_downloads
+          
+          # Prüfen ob Assets existieren
+          if gh release view "$TAG_NAME" -R "$UPSTREAM_REPO" --json assets --jq '.assets | length' | grep -q '^[1-9]'; then
+            echo "Assets found, downloading..."
+            if gh release download "$TAG_NAME" -R "$UPSTREAM_REPO"; then
+              # Assets hochladen falls vorhanden
+              if ls ./* >/dev/null 2>&1; then
+                echo "Uploading assets to fork release..."
+                gh release upload "$TAG_NAME" -R "$FORK_REPO" ./* || {
+                  echo "Warning: Failed to upload some assets for $TAG_NAME"
+                }
+              fi
+            else
+              echo "Warning: Failed to download assets for $TAG_NAME"
             fi
             
             # Cleanup
-            rm -f ./*
-            cd ..
+            rm -f ./* 2>/dev/null || true
+          else
+            echo "No assets found for $TAG_NAME"
           fi
           
+          cd ..
           echo "✅ Successfully synced release: $TAG_NAME"
           echo ""
         done
@@ -179,5 +182,5 @@ jobs:
     - name: Cleanup
       if: always()
       run: |
-        rm -rf temp_downloads release_assets
+        rm -rf temp_downloads
         rm -f upstream_releases.json fork_releases.json releases_to_sync.json temp_body.md
