@@ -1,0 +1,183 @@
+name: Sync Upstream Releases
+
+on:
+  schedule:
+    # Täglich um 02:00 UTC prüfen
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: 'Force sync all releases (ignore existing)'
+        required: false
+        default: 'false'
+        type: boolean
+      specific_tag:
+        description: 'Sync only specific tag (optional)'
+        required: false
+        type: string
+
+env:
+  UPSTREAM_REPO: 'pioarduino/registry'
+  FORK_REPO: ${{ github.repository }}
+
+jobs:
+  sync-releases:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      
+    steps:
+    - name: Checkout Fork
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup GitHub CLI
+      run: |
+        gh --version
+        echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+    
+    - name: Get Upstream Releases
+      id: upstream
+      run: |
+        echo "Fetching releases from $UPSTREAM_REPO..."
+        
+        # Alle Releases vom upstream Repository abrufen
+        gh release list -R "$UPSTREAM_REPO" \
+          --json tagName,name,body,draft,prerelease,publishedAt,assets \
+          --limit 50 > upstream_releases.json
+        
+        echo "Found $(jq length upstream_releases.json) upstream releases"
+        cat upstream_releases.json | jq -r '.[].tagName' | head -10
+    
+    - name: Get Fork Releases
+      id: fork
+      run: |
+        echo "Fetching existing releases from fork..."
+        
+        # Existierende Releases im Fork abrufen
+        gh release list -R "$FORK_REPO" \
+          --json tagName \
+          --limit 50 > fork_releases.json || echo "[]" > fork_releases.json
+        
+        echo "Found $(jq length fork_releases.json) fork releases"
+    
+    - name: Determine Releases to Sync
+      id: sync_plan
+      run: |
+        # Releases identifizieren, die synchronisiert werden müssen
+        if [ "${{ github.event.inputs.specific_tag }}" != "" ]; then
+          # Nur spezifischen Tag synchronisieren
+          echo "Syncing specific tag: ${{ github.event.inputs.specific_tag }}"
+          jq --arg tag "${{ github.event.inputs.specific_tag }}" \
+             '[.[] | select(.tagName == $tag)]' upstream_releases.json > releases_to_sync.json
+        elif [ "${{ github.event.inputs.force_sync }}" == "true" ]; then
+          # Alle Releases synchronisieren (force)
+          echo "Force syncing all releases"
+          cp upstream_releases.json releases_to_sync.json
+        else
+          # Nur neue Releases synchronisieren
+          echo "Syncing new releases only"
+          jq --slurpfile fork fork_releases.json \
+             '[.[] | select(.tagName as $tag | $fork[0] | map(.tagName) | index($tag) | not)]' \
+             upstream_releases.json > releases_to_sync.json
+        fi
+        
+        RELEASES_COUNT=$(jq length releases_to_sync.json)
+        echo "releases_count=$RELEASES_COUNT" >> $GITHUB_OUTPUT
+        echo "Will sync $RELEASES_COUNT releases"
+        
+        if [ "$RELEASES_COUNT" -gt 0 ]; then
+          echo "Releases to sync:"
+          jq -r '.[].tagName' releases_to_sync.json
+        fi
+    
+    - name: Create Workspace
+      if: steps.sync_plan.outputs.releases_count > 0
+      run: |
+        mkdir -p release_assets
+        mkdir -p temp_downloads
+    
+    - name: Sync Releases
+      if: steps.sync_plan.outputs.releases_count > 0
+      run: |
+        # Jedes Release verarbeiten
+        jq -c '.[]' releases_to_sync.json | while read -r release; do
+          TAG_NAME=$(echo "$release" | jq -r '.tagName')
+          RELEASE_NAME=$(echo "$release" | jq -r '.name')
+          RELEASE_BODY=$(echo "$release" | jq -r '.body // ""')
+          IS_DRAFT=$(echo "$release" | jq -r '.draft')
+          IS_PRERELEASE=$(echo "$release" | jq -r '.prerelease')
+          ASSETS=$(echo "$release" | jq -c '.assets')
+          ASSETS_COUNT=$(echo "$ASSETS" | jq length)
+          
+          echo "=== Syncing Release: $TAG_NAME ==="
+          echo "Assets count: $ASSETS_COUNT"
+          
+          # Release im Fork erstellen (falls nicht existiert)
+          DRAFT_FLAG=""
+          PRERELEASE_FLAG=""
+          [ "$IS_DRAFT" == "true" ] && DRAFT_FLAG="--draft"
+          [ "$IS_PRERELEASE" == "true" ] && PRERELEASE_FLAG="--prerelease"
+          
+          # Prüfen ob Release bereits existiert
+          if gh release view "$TAG_NAME" -R "$FORK_REPO" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME already exists, deleting first..."
+            gh release delete "$TAG_NAME" -R "$FORK_REPO" --yes || true
+          fi
+          
+          # Release erstellen
+          echo "Creating release $TAG_NAME..."
+          echo "$RELEASE_BODY" > temp_body.md
+          gh release create "$TAG_NAME" \
+            -R "$FORK_REPO" \
+            --title "$RELEASE_NAME" \
+            --notes-file temp_body.md \
+            $DRAFT_FLAG $PRERELEASE_FLAG
+          
+          # Assets herunterladen und hochladen
+          if [ "$ASSETS_COUNT" -gt 0 ]; then
+            echo "Downloading and uploading $ASSETS_COUNT assets..."
+            
+            # Assets vom upstream herunterladen
+            cd temp_downloads
+            gh release download "$TAG_NAME" -R "$UPSTREAM_REPO" || {
+              echo "Failed to download assets for $TAG_NAME"
+              cd ..
+              continue
+            }
+            
+            # Alle heruntergeladenen Dateien zum Fork-Release hochladen
+            if ls ./* >/dev/null 2>&1; then
+              echo "Uploading assets to fork release..."
+              gh release upload "$TAG_NAME" -R "$FORK_REPO" ./* || {
+                echo "Failed to upload some assets for $TAG_NAME"
+              }
+            fi
+            
+            # Cleanup
+            rm -f ./*
+            cd ..
+          fi
+          
+          echo "✅ Successfully synced release: $TAG_NAME"
+          echo ""
+        done
+    
+    - name: Summary
+      if: always()
+      run: |
+        echo "=== Sync Summary ==="
+        echo "Upstream repo: $UPSTREAM_REPO"
+        echo "Fork repo: $FORK_REPO"
+        echo "Releases processed: ${{ steps.sync_plan.outputs.releases_count }}"
+        
+        echo ""
+        echo "Current fork releases:"
+        gh release list -R "$FORK_REPO" --limit 10 || echo "No releases found"
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        rm -rf temp_downloads release_assets
+        rm -f upstream_releases.json fork_releases.json releases_to_sync.json temp_body.md
