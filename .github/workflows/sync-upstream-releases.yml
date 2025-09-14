@@ -79,21 +79,102 @@ jobs:
         
         RELEASES_COUNT=$(jq length releases_to_sync.json)
         echo "releases_count=$RELEASES_COUNT" >> $GITHUB_OUTPUT
-        echo "Will sync $RELEASES_COUNT releases"
+        echo "New releases to sync: $RELEASES_COUNT"
         
         if [ "$RELEASES_COUNT" -gt 0 ]; then
-          echo "Releases to sync:"
+          echo "New releases to sync:"
           jq -r '.[].tagName' releases_to_sync.json
         fi
     
+    - name: Check for Asset Changes in Existing Releases
+      id: asset_changes
+      if: github.event.inputs.force_sync != 'true' && github.event.inputs.specific_tag == ''
+      run: |
+        echo "Checking for asset changes in existing releases..."
+        
+        # Temporäre Datei für geänderte Releases
+        > changed_releases.txt
+        
+        # Nur existierende Releases prüfen (die sowohl im upstream als auch im fork existieren)
+        jq --slurpfile upstream upstream_releases.json \
+           '[.[] | select(.tagName as $tag | $upstream[0] | map(.tagName) | index($tag))]' \
+           fork_releases.json > existing_releases.json
+        
+        EXISTING_COUNT=$(jq length existing_releases.json)
+        echo "Checking $EXISTING_COUNT existing releases for asset changes..."
+        
+        if [ "$EXISTING_COUNT" -gt 0 ]; then
+          jq -r '.[].tagName' existing_releases.json | while read -r TAG_NAME; do
+            echo "Checking assets for release: $TAG_NAME"
+            
+            # Asset-Info vom upstream abrufen
+            UPSTREAM_ASSETS=$(gh release view "$TAG_NAME" -R "$UPSTREAM_REPO" --json assets --jq '.assets | sort_by(.name)' 2>/dev/null || echo "[]")
+            
+            # Asset-Info vom fork abrufen  
+            FORK_ASSETS=$(gh release view "$TAG_NAME" -R "$FORK_REPO" --json assets --jq '.assets | sort_by(.name)' 2>/dev/null || echo "[]")
+            
+            # Asset-Signaturen vergleichen (Name + Größe)
+            UPSTREAM_SIG=$(echo "$UPSTREAM_ASSETS" | jq -r 'map("\(.name):\(.size // 0)") | sort | join(",")')
+            FORK_SIG=$(echo "$FORK_ASSETS" | jq -r 'map("\(.name):\(.size // 0)") | sort | join(",")')
+            
+            if [ "$UPSTREAM_SIG" != "$FORK_SIG" ]; then
+              echo "Asset changes detected in: $TAG_NAME"
+              echo "  Upstream assets: $UPSTREAM_SIG"
+              echo "  Fork assets: $FORK_SIG"
+              echo "$TAG_NAME" >> changed_releases.txt
+            else
+              echo "  No changes in: $TAG_NAME"
+            fi
+          done
+        fi
+        
+        # Geänderte Releases zur Sync-Liste hinzufügen
+        if [ -s changed_releases.txt ]; then
+          echo ""
+          echo "Releases with asset changes:"
+          cat changed_releases.txt
+          
+          # Geänderte Releases zur bestehenden Sync-Liste hinzufügen
+          while read -r tag; do
+            jq --arg tag "$tag" \
+               '. + [.[] | select(.tagName == $tag)]' \
+               upstream_releases.json >> temp_changed.json
+          done < changed_releases.txt
+          
+          # Alle Releases kombinieren und Duplikate entfernen
+          if [ -f temp_changed.json ]; then
+            cat releases_to_sync.json temp_changed.json | jq -s 'add | unique_by(.tagName)' > combined_releases.json
+            mv combined_releases.json releases_to_sync.json
+            rm -f temp_changed.json
+          fi
+          
+          CHANGED_COUNT=$(wc -l < changed_releases.txt)
+          echo "asset_changes_count=$CHANGED_COUNT" >> $GITHUB_OUTPUT
+          echo "Found $CHANGED_COUNT releases with asset changes"
+        else
+          echo "No asset changes detected in existing releases"
+          echo "asset_changes_count=0" >> $GITHUB_OUTPUT
+        fi
+        
+        # Cleanup
+        rm -f changed_releases.txt existing_releases.json
+        
+        # Update total count
+        TOTAL_COUNT=$(jq length releases_to_sync.json)
+        echo "total_releases_count=$TOTAL_COUNT" >> $GITHUB_OUTPUT
+        echo "Total releases to sync: $TOTAL_COUNT"
+    
     - name: Create Workspace
-      if: steps.sync_plan.outputs.releases_count > 0
+      if: steps.sync_plan.outputs.releases_count > 0 || steps.asset_changes.outputs.asset_changes_count > 0
       run: |
         mkdir -p temp_downloads
     
     - name: Sync Releases
-      if: steps.sync_plan.outputs.releases_count > 0
+      if: steps.sync_plan.outputs.releases_count > 0 || steps.asset_changes.outputs.asset_changes_count > 0
       run: |
+        TOTAL_RELEASES=$(jq length releases_to_sync.json)
+        echo "Processing $TOTAL_RELEASES releases..."
+        
         jq -c '.[]' releases_to_sync.json | while read -r release; do
           TAG_NAME=$(echo "$release" | jq -r '.tagName')
           RELEASE_NAME=$(echo "$release" | jq -r '.name')
@@ -116,8 +197,9 @@ jobs:
           
           # Existierendes Release löschen falls vorhanden
           if gh release view "$TAG_NAME" -R "$FORK_REPO" >/dev/null 2>&1; then
-            echo "Release $TAG_NAME already exists, deleting first..."
+            echo "Release $TAG_NAME already exists, deleting for update..."
             gh release delete "$TAG_NAME" -R "$FORK_REPO" --yes || true
+            sleep 2  # Kurze Pause nach dem Löschen
           fi
           
           # Release erstellen
@@ -138,25 +220,31 @@ jobs:
           fi
           
           # Assets herunterladen und hochladen
-          echo "Downloading assets for $TAG_NAME..."
+          echo "Processing assets for $TAG_NAME..."
           cd temp_downloads
           
           # Prüfen ob Assets existieren
-          if gh release view "$TAG_NAME" -R "$UPSTREAM_REPO" --json assets --jq '.assets | length' | grep -q '^[1-9]'; then
-            echo "Assets found, downloading..."
-            if gh release download "$TAG_NAME" -R "$UPSTREAM_REPO"; then
+          ASSET_COUNT=$(gh release view "$TAG_NAME" -R "$UPSTREAM_REPO" --json assets --jq '.assets | length' 2>/dev/null || echo "0")
+          
+          if [ "$ASSET_COUNT" -gt 0 ]; then
+            echo "Found $ASSET_COUNT assets, downloading..."
+            if gh release download "$TAG_NAME" -R "$UPSTREAM_REPO" 2>/dev/null; then
               # Assets hochladen falls vorhanden
               if ls ./* >/dev/null 2>&1; then
                 echo "Uploading assets to fork release..."
-                gh release upload "$TAG_NAME" -R "$FORK_REPO" ./* || {
-                  echo "Warning: Failed to upload some assets for $TAG_NAME"
-                }
+                if gh release upload "$TAG_NAME" -R "$FORK_REPO" ./*; then
+                  echo "Successfully uploaded all assets"
+                else
+                  echo "Warning: Some assets failed to upload for $TAG_NAME"
+                fi
+              else
+                echo "No asset files found after download"
               fi
             else
               echo "Warning: Failed to download assets for $TAG_NAME"
             fi
             
-            # Cleanup
+            # Cleanup downloaded files
             rm -f ./* 2>/dev/null || true
           else
             echo "No assets found for $TAG_NAME"
@@ -173,10 +261,12 @@ jobs:
         echo "=== Sync Summary ==="
         echo "Upstream repo: $UPSTREAM_REPO"
         echo "Fork repo: $FORK_REPO"
-        echo "Releases processed: ${{ steps.sync_plan.outputs.releases_count }}"
+        echo "New releases synced: ${{ steps.sync_plan.outputs.releases_count }}"
+        echo "Updated releases (asset changes): ${{ steps.asset_changes.outputs.asset_changes_count }}"
+        echo "Total releases processed: ${{ steps.asset_changes.outputs.total_releases_count }}"
         
         echo ""
-        echo "Current fork releases:"
+        echo "Current fork releases (latest 10):"
         gh release list -R "$FORK_REPO" --limit 10 || echo "No releases found"
     
     - name: Cleanup
